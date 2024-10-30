@@ -1,0 +1,618 @@
+#David Ruiz (@viajatech)
+
+#pip install --upgrade opencv-python numpy scikit-learn pillow transformers torch torchvision deepface tensorflow
+#pip install --upgrade pip
+#pip install opencv-python numpy scikit-learn pillow transformers torch torchvision deepface tensorflow
+
+
+#Opcional CUDA 
+#pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu117
+
+
+
+
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import cv2
+import os
+import numpy as np
+import pickle
+from sklearn.metrics.pairwise import cosine_similarity
+from PIL import Image, ImageTk
+from threading import Thread
+import time
+import logging
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from deepface import DeepFace
+
+class CybermoodApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Cybermood by ViajaTech")
+        master.geometry("800x600")
+        master.configure(bg='#1e1e2e')
+
+        # Variables
+        self.model_loaded = False
+        self.stop_threads = False
+        self.current_emotion = "neutral"
+        self.last_emotion = None  # Para detectar cambios en la emoción
+        self.chat_history = ""
+        self.cap = None  # Inicializar cámara más tarde
+
+        # Configurar logging
+        self.setup_logging()
+
+        # Iniciar carga del modelo en un hilo separado
+        self.model_thread = Thread(target=self.initialize_model, daemon=True)
+        self.model_thread.start()
+
+        # Aplicar estilos personalizados
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background='#1e1e2e')
+        style.configure('TLabel', background='#1e1e2e', foreground='#00ffaa', font=("Helvetica", 12))
+        style.configure('TEntry', fieldbackground='#313244', foreground='#00ffaa', font=("Helvetica", 12))
+        style.configure('TButton', background='#00ffaa', foreground='#000000', font=("Helvetica", 12))
+        style.configure('TProgressbar', troughcolor='#1e1e2e', background='#00ffaa')
+
+        # Main Frame
+        self.frame = tk.Frame(master, bg='#1e1e2e')
+        self.frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        self.welcome_label = ttk.Label(self.frame, text="Bienvenido a Cybermood by ViajaTech", font=("Helvetica", 16))
+        self.welcome_label.pack(pady=10)
+
+        self.login_button = ttk.Button(self.frame, text="Iniciar Sesión", command=self.open_login_window)
+        self.login_button.pack(pady=10)
+
+        self.register_button = ttk.Button(self.frame, text="Registrarse", command=self.open_register_window)
+        self.register_button.pack(pady=10)
+
+        # Indicador de carga del modelo
+        self.loading_label = ttk.Label(self.frame, text="Cargando modelo de lenguaje...", font=("Helvetica", 12))
+        self.loading_label.pack(pady=10)
+
+        self.progress = ttk.Progressbar(self.frame, mode='indeterminate')
+        self.progress.pack(pady=10)
+        self.progress.start(10)  # Iniciar movimiento del progressbar
+
+    def setup_logging(self):
+        # Configurar logger
+        self.logger = logging.getLogger("CybermoodLogger")
+        self.logger.setLevel(logging.DEBUG)
+
+        # Crear ventana de logs
+        self.log_window = tk.Toplevel(self.master)
+        self.log_window.title("Logs")
+        self.log_window.geometry("600x400")
+        self.log_window.configure(bg='#1e1e2e')
+
+        log_frame = tk.Frame(self.log_window, bg='#1e1e2e')
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.log_text = scrolledtext.ScrolledText(log_frame, state='disabled', bg='#1e1e2e', fg='#ffffff', font=("Consolas", 10))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        # Configurar handler para mostrar logs en la ventana
+        handler = logging.StreamHandler(self)
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+
+    def write(self, message):
+        # Método requerido por StreamHandler para escribir en la ventana de logs
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, message)
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+
+    def flush(self):
+        pass  # Necesario para StreamHandler
+
+    def initialize_camera(self):
+        # Forzar el uso de DirectShow en Windows
+        if os.name == 'nt':
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(0)
+
+        if not cap.isOpened():
+            self.logger.error("No se pudo acceder a la cámara. Asegúrate de que esté conectada y no esté siendo utilizada por otra aplicación.")
+            messagebox.showerror("Error", "No se pudo acceder a la cámara. Asegúrate de que esté conectada y no esté siendo utilizada por otra aplicación.")
+            return None
+        self.logger.info("Cámara iniciada correctamente.")
+        return cap
+
+    def initialize_model(self):
+        # Cargar un modelo de lenguaje en español optimizado
+        try:
+            self.logger.info("Iniciando carga del modelo de lenguaje en español...")
+            # Utilizar un modelo de HuggingFace optimizado para español
+            self.tokenizer = AutoTokenizer.from_pretrained("datificate/gpt2-small-spanish")
+            self.model = AutoModelForCausalLM.from_pretrained("datificate/gpt2-small-spanish")
+            if torch.cuda.is_available():
+                self.model.to('cuda')
+                self.logger.info("Modelo de lenguaje cargado en GPU.")
+            else:
+                self.logger.info("Modelo de lenguaje cargado en CPU.")
+            self.model.eval()
+            self.model_loaded = True
+            self.logger.info("Modelo de lenguaje cargado correctamente.")
+            # Detener el indicador de carga
+            self.loading_label.config(text="Modelo de lenguaje cargado.")
+            self.progress.stop()
+            self.loading_label.pack_forget()
+            self.progress.pack_forget()
+        except Exception as e:
+            self.logger.error(f"Error al cargar el modelo de lenguaje: {e}")
+            messagebox.showerror("Error", "No se pudo cargar el modelo de lenguaje.")
+
+    def open_login_window(self):
+        login_window = tk.Toplevel(self.master)
+        login_window.title("Iniciar Sesión")
+        login_window.geometry("400x300")
+        login_window.configure(bg='#1e1e2e')
+
+        login_frame = tk.Frame(login_window, bg='#1e1e2e')
+        login_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        login_label = ttk.Label(login_frame, text="Iniciar Sesión", font=("Helvetica", 14))
+        login_label.pack(pady=10)
+
+        username_label = ttk.Label(login_frame, text="Nombre de Usuario:")
+        username_label.pack(pady=5)
+
+        username_entry = ttk.Entry(login_frame, width=30)
+        username_entry.pack(pady=5)
+
+        verify_button = ttk.Button(login_frame, text="Verificar", command=lambda: self.login(username_entry.get(), login_window))
+        verify_button.pack(pady=20)
+
+    def open_register_window(self):
+        register_window = tk.Toplevel(self.master)
+        register_window.title("Registrarse")
+        register_window.geometry("800x600")
+        register_window.configure(bg='#1e1e2e')
+
+        register_frame = tk.Frame(register_window, bg='#1e1e2e')
+        register_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        register_label = ttk.Label(register_frame, text="Registrarse", font=("Helvetica", 14))
+        register_label.pack(pady=10)
+
+        username_label = ttk.Label(register_frame, text="Nombre de Usuario:")
+        username_label.pack(pady=5)
+
+        username_entry = ttk.Entry(register_frame, width=30)
+        username_entry.pack(pady=5)
+
+        capture_button = ttk.Button(register_frame, text="Capturar y Registrar", command=lambda: self.register(username_entry.get(), register_window))
+        capture_button.pack(pady=20)
+
+    def login(self, username, window):
+        if not username:
+            messagebox.showerror("Error", "Por favor, ingrese un nombre de usuario.")
+            return
+
+        if not os.path.exists(f'faces/{username}.pkl'):
+            messagebox.showerror("Error", "Usuario no registrado. Por favor, regístrese primero.")
+            return
+
+        if self.cap is None:
+            self.cap = self.initialize_camera()
+            if self.cap is None:
+                return
+
+        # Iniciar la verificación en un hilo separado
+        Thread(target=self.verify_face, args=(username, window), daemon=True).start()
+
+    def register(self, username, window):
+        if not username:
+            messagebox.showerror("Error", "Por favor, ingrese un nombre de usuario.")
+            return
+
+        if os.path.exists(f'faces/{username}.pkl'):
+            messagebox.showerror("Error", "Este usuario ya está registrado.")
+            return
+
+        if self.cap is None:
+            self.cap = self.initialize_camera()
+            if self.cap is None:
+                return
+
+        # Iniciar el registro en un hilo separado
+        Thread(target=self.capture_and_save_face, args=(username, window), daemon=True).start()
+
+    def capture_and_save_face(self, username, window):
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+        if face_cascade.empty():
+            self.logger.error("No se pudo cargar el clasificador de cascada facial.")
+            messagebox.showerror("Error", "No se pudo cargar el clasificador de cascada facial.")
+            return
+
+        # Crear una ventana de previsualización
+        preview_window = tk.Toplevel(self.master)
+        preview_window.title("Captura Facial")
+        preview_window.geometry("600x500")
+        preview_window.configure(bg='#1e1e2e')
+
+        # Etiqueta para mostrar la transmisión de video
+        video_label = tk.Label(preview_window, bg='#1e1e2e')
+        video_label.pack(padx=10, pady=10)
+
+        # Etiqueta para el contador
+        countdown_label = ttk.Label(preview_window, text="Capturando en: 10", font=("Helvetica", 16), foreground='#00ffaa', background='#1e1e2e')
+        countdown_label.pack(pady=10)
+
+        # Variables para el contador
+        capture_countdown = 10
+        capturing = False
+
+        def update_frame():
+            nonlocal capture_countdown, capturing
+            ret, frame = self.cap.read()
+            if ret:
+                # Convertir el color para tkinter
+                cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(cv2image)
+                imgtk = ImageTk.PhotoImage(image=img)
+                video_label.imgtk = imgtk
+                video_label.configure(image=imgtk)
+
+                if capture_countdown > 0:
+                    countdown_label.config(text=f"Capturando en: {capture_countdown}")
+                    capture_countdown -= 1
+                    countdown_label.after(1000, update_frame)
+                elif capture_countdown == 0 and not capturing:
+                    capturing = True
+                    countdown_label.config(text="Capturando...")
+                    # Realizar la captura
+                    self.perform_capture(frame, face_cascade, username, preview_window, window)
+            else:
+                countdown_label.config(text="Error al acceder a la cámara.")
+                self.logger.error("Error al capturar el frame de la cámara.")
+                preview_window.destroy()
+
+        update_frame()
+
+    def perform_capture(self, frame, face_cascade, username, preview_window, register_window):
+        # Procesar el frame capturado
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
+
+        if len(faces) == 0:
+            self.logger.error("No se detectó ninguna cara durante el registro.")
+            messagebox.showerror("Error", "No se detectó ninguna cara. Por favor, inténtelo de nuevo.")
+            preview_window.destroy()
+            return
+
+        x, y, w, h = faces[0]
+        face = gray[y:y+h, x:x+w]
+        face_resized = cv2.resize(face, (100, 100))
+
+        if not os.path.exists('faces'):
+            os.makedirs('faces')
+
+        cv2.imwrite(f'faces/{username}.jpg', face_resized)
+
+        face_encoding = face_resized.flatten().astype(np.float64)
+        norm = np.linalg.norm(face_encoding)
+        if norm == 0:
+            self.logger.error("Norma del encoding de la cara es cero.")
+            messagebox.showerror("Error", "Error en el procesamiento de la cara. Por favor, inténtelo de nuevo.")
+            preview_window.destroy()
+            return
+        face_encoding /= norm
+
+        with open(f'faces/{username}.pkl', 'wb') as f:
+            pickle.dump(face_encoding, f)
+
+        preview_window.destroy()
+        register_window.destroy()  # Cerrar la ventana de registro
+        self.logger.info(f"Usuario '{username}' registrado correctamente.")
+        messagebox.showinfo("Éxito", f"Usuario '{username}' registrado correctamente.")
+
+    def verify_face(self, username, window):
+        with open(f'faces/{username}.pkl', 'rb') as f:
+            saved_encoding = pickle.load(f)
+
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+        if face_cascade.empty():
+            self.logger.error("No se pudo cargar el clasificador de cascada facial durante la verificación.")
+            messagebox.showerror("Error", "No se pudo cargar el clasificador de cascada facial.")
+            return
+
+        # Crear una ventana de verificación
+        verification_window = tk.Toplevel(self.master)
+        verification_window.title("Verificación Facial")
+        verification_window.geometry("600x500")
+        verification_window.configure(bg='#1e1e2e')
+
+        # Etiqueta para mostrar la transmisión de video
+        video_label = tk.Label(verification_window, bg='#1e1e2e')
+        video_label.pack(padx=10, pady=10)
+
+        # Etiqueta para el contador
+        countdown_label = ttk.Label(verification_window, text="Verificando en: 10", font=("Helvetica", 16), foreground='#00ffaa', background='#1e1e2e')
+        countdown_label.pack(pady=10)
+
+        # Variables para el contador
+        verify_countdown = 10
+        verified = False
+
+        def update_verification_frame():
+            nonlocal verify_countdown, verified
+            ret, frame = self.cap.read()
+            if ret:
+                # Convertir el color para tkinter
+                cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(cv2image)
+                imgtk = ImageTk.PhotoImage(image=img)
+                video_label.imgtk = imgtk
+                video_label.configure(image=imgtk)
+
+                if verify_countdown > 0:
+                    countdown_label.config(text=f"Verificando en: {verify_countdown}")
+                    verify_countdown -= 1
+                    countdown_label.after(1000, update_verification_frame)
+                elif verify_countdown == 0 and not verified:
+                    verified = True
+                    countdown_label.config(text="Verificando...")
+                    # Realizar la verificación
+                    self.perform_verification(frame, face_cascade, saved_encoding, verification_window, username, window)
+            else:
+                countdown_label.config(text="Error al acceder a la cámara.")
+                self.logger.error("Error al capturar el frame de la cámara durante la verificación.")
+                verification_window.destroy()
+
+        update_verification_frame()
+
+    def perform_verification(self, frame, face_cascade, saved_encoding, verification_window, username, login_window):
+        # Procesar el frame capturado
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
+
+        similarity = 0
+
+        for (x, y, w, h) in faces:
+            face = gray[y:y+h, x:x+w]
+            face_resized = cv2.resize(face, (100, 100))
+            face_encoding = face_resized.flatten().astype(np.float64)
+            norm = np.linalg.norm(face_encoding)
+            if norm == 0:
+                self.logger.error("Norma del encoding de la cara es cero durante la verificación.")
+                continue
+            face_encoding /= norm
+
+            similarity = cosine_similarity(saved_encoding.reshape(1, -1), face_encoding.reshape(1, -1))[0][0]
+            break  # Solo verificar la primera cara detectada
+
+        verification_window.destroy()
+
+        if similarity > 0.8:
+            self.logger.info(f"Usuario '{username}' verificado exitosamente. Similaridad: {similarity}")
+            messagebox.showinfo("Éxito", f"Bienvenido, {username}!")
+            login_window.destroy()
+            self.open_main_app(username)
+        else:
+            self.logger.warning(f"Verificación facial fallida para el usuario '{username}'. Similaridad: {similarity}")
+            messagebox.showerror("Error", "Verificación facial fallida. Acceso denegado.")
+
+    def open_main_app(self, username):
+        main_window = tk.Toplevel(self.master)
+        main_window.title("Cybermood by ViajaTech - Dashboard")
+        main_window.geometry("1000x700")
+        main_window.configure(bg='#1e1e2e')
+
+        # Frame Layout
+        top_frame = tk.Frame(main_window, bg='#1e1e2e')
+        top_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=False, padx=10, pady=10)
+
+        self.username_label = ttk.Label(top_frame, text=f"Usuario: {username}", font=("Helvetica", 14))
+        self.username_label.pack(side=tk.LEFT, padx=10)
+
+        self.emotion_label = ttk.Label(top_frame, text="Emoción: Detectando...", font=("Helvetica", 14))
+        self.emotion_label.pack(side=tk.RIGHT, padx=10)
+
+        bottom_frame = tk.Frame(main_window, bg='#1e1e2e')
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=False, padx=10, pady=10)
+
+        # Chat Display
+        self.chat_display = tk.Text(main_window, state='disabled', bg='#313244', fg='#00ffaa', font=("Helvetica", 12))
+        self.chat_display.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        # User Input
+        self.user_input = tk.Entry(bottom_frame, width=80, bg='#313244', fg='#00ffaa', font=("Helvetica", 12))
+        self.user_input.pack(side=tk.LEFT, padx=10, pady=10)
+        self.user_input.bind("<Return>", self.send_message)
+
+        send_button = ttk.Button(bottom_frame, text="Enviar", command=self.send_message)
+        send_button.pack(side=tk.LEFT, padx=10)
+
+        # Video Display
+        self.video_label = tk.Label(main_window, bg='#1e1e2e')
+        self.video_label.pack(side=tk.RIGHT, padx=10, pady=10)
+
+        # Iniciar Threads para video y detección de emociones
+        Thread(target=self.start_video_stream, daemon=True).start()
+        Thread(target=self.emotion_detection_thread, daemon=True).start()
+
+    def start_video_stream(self):
+        while not self.stop_threads and self.cap is not None:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.logger.error("Error al capturar el frame de la cámara para el video stream.")
+                continue
+
+            # Resize frame para mostrar en la GUI
+            frame = cv2.resize(frame, (400, 300))
+            # Convertir a RGB
+            cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(cv2image)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.video_label.imgtk = imgtk
+            self.video_label.configure(image=imgtk)
+
+    def emotion_detection_thread(self):
+        # Mapeo de emociones de inglés a español
+        emotion_mapping = {
+            "angry": "enojado",
+            "disgust": "asco",
+            "fear": "miedo",
+            "happy": "feliz",
+            "sad": "triste",
+            "surprise": "sorprendido",
+            "neutral": "neutral"
+        }
+
+        while not self.stop_threads and self.cap is not None:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.logger.error("Error al capturar el frame de la cámara para la detección de emociones.")
+                continue
+
+            try:
+                analysis = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False)
+                if isinstance(analysis, list):
+                    analysis = analysis[0]
+                emotion = analysis.get('dominant_emotion', "Desconocida")
+                emotion_es = emotion_mapping.get(emotion.lower(), "Desconocida")
+                self.current_emotion = emotion_es
+                self.update_emotion_label(emotion_es)
+                self.logger.info(f"Emoción detectada: {emotion_es}")
+
+                # Verificar si la emoción ha cambiado para generar una respuesta proactiva
+                if self.last_emotion != self.current_emotion:
+                    self.last_emotion = self.current_emotion
+                    Thread(target=self.generate_response_proactive, args=(self.current_emotion,), daemon=True).start()
+            except Exception as e:
+                self.logger.error(f"Error en detección de emociones: {e}")
+                self.update_emotion_label("Desconocida")
+
+            time.sleep(2)  # Actualizar cada 2 segundos
+
+    def update_emotion_label(self, emotion):
+        self.emotion_label.config(text=f"Emoción: {emotion}")
+
+    def send_message(self, event=None):
+        user_msg = self.user_input.get()
+        if not user_msg.strip():
+            return
+
+        self.chat_display.config(state='normal')
+        self.chat_display.insert(tk.END, f"Tú: {user_msg}\n")
+        self.chat_display.config(state='disabled')
+        self.chat_display.see(tk.END)
+        self.user_input.delete(0, tk.END)
+
+        Thread(target=self.generate_response, args=(user_msg,), daemon=True).start()
+
+    def generate_response(self, user_msg):
+        if not self.model_loaded:
+            self.logger.warning("El modelo de lenguaje aún se está cargando. Por favor, espera un momento.")
+            messagebox.showwarning("Advertencia", "El modelo de lenguaje aún se está cargando. Por favor, espera un momento.")
+            return
+
+        # Incorporar la emoción en el prompt
+        prompt = f"El usuario está {self.current_emotion}. {user_msg}\nRespuesta empática y coherente:"
+
+        inputs = self.tokenizer.encode(prompt, return_tensors='pt')
+        if torch.cuda.is_available():
+            inputs = inputs.to('cuda')
+
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs,
+                    max_length=20,  # Limitar a 15-20 palabras
+                    num_return_sequences=1,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    temperature=0.6,  # Temperatura más baja para mayor coherencia
+                    top_p=0.8,        # Valor top_p reducido
+                    do_sample=True,
+                    no_repeat_ngram_size=2,
+                    early_stopping=True
+                )
+
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            response = response.replace(prompt, '').strip()
+
+            # Limpiar repeticiones en la respuesta
+            response = self.clean_response(response)
+
+            # Verificar si la respuesta está vacía o es incoherente
+            if not response or len(response.split()) > 15:
+                # Usar respuesta predefinida si la respuesta generada es incoherente
+                response = self.get_predefined_response(self.current_emotion)
+
+            self.chat_display.config(state='normal')
+            self.chat_display.insert(tk.END, f"Cybermood: {response}\n")
+            self.chat_display.config(state='disabled')
+            self.chat_display.see(tk.END)
+            self.logger.info(f"Respuesta del chatbot: {response}")
+        except Exception as e:
+            self.logger.error(f"Error al generar la respuesta del chatbot: {e}")
+            self.chat_display.config(state='normal')
+            self.chat_display.insert(tk.END, f"Cybermood: Error al generar la respuesta.\n")
+            self.chat_display.config(state='disabled')
+            self.chat_display.see(tk.END)
+            messagebox.showerror("Error", "Ocurrió un error al generar la respuesta del chatbot.")
+
+    def generate_response_proactive(self, emotion):
+        if not self.model_loaded:
+            self.logger.warning("El modelo de lenguaje aún se está cargando. Por favor, espera un momento.")
+            return
+
+        # Usar respuesta predefinida basada en la emoción
+        response = self.get_predefined_response(emotion)
+
+        # Mostrar la respuesta en el chat
+        self.chat_display.config(state='normal')
+        self.chat_display.insert(tk.END, f"Cybermood: {response}\n")
+        self.chat_display.config(state='disabled')
+        self.chat_display.see(tk.END)
+        self.logger.info(f"Respuesta proactiva del chatbot: {response}")
+
+    def get_predefined_response(self, emotion):
+        # Definir respuestas predeterminadas basadas en la emoción
+        predefined_responses = {
+            "feliz": "¡Me alegra que te sientas feliz! ¿Hay algo que quieras compartir?",
+            "triste": "Lamento que te sientas triste. Estoy aquí para escucharte.",
+            "enojado": "Lamento que te sientas enojado. ¿Hay algo en lo que pueda ayudarte?",
+            "miedo": "Es normal sentir miedo a veces. ¿Quieres hablar sobre ello?",
+            "sorprendido": "Entiendo que te sientas sorprendido. ¿Qué ha pasado?",
+            "neutral": "Estoy aquí para ayudarte en lo que necesites."
+        }
+        return predefined_responses.get(emotion, "Estoy aquí para ayudarte en lo que necesites.")
+
+    def clean_response(self, response):
+        # Implementar lógica para evitar respuestas repetitivas y limitar a 25 palabras
+        lines = response.split('\n')
+        cleaned_lines = []
+        seen = set()
+        for line in lines:
+            line = line.strip()
+            if line and line not in seen:
+                cleaned_lines.append(line)
+                seen.add(line)
+        # Limitar a 25 palabras
+        words = ' '.join(cleaned_lines).split()
+        return ' '.join(words[:25])
+
+    def on_closing(self):
+        self.stop_threads = True
+        if self.cap is not None:
+            self.cap.release()
+        self.logger.info("Aplicación cerrada por el usuario.")
+        self.master.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = CybermoodApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
